@@ -126,6 +126,48 @@ describe('synthesize_concepts change detection', () => {
     expect(edges).toContain('atoms/2026-01-01/practice-10');
   });
 
+  test('a page upgraded by an overlapping run after the state snapshot is not overwritten with a stub', async () => {
+    // Two concepts so the upgrade can land between the run-start snapshot and
+    // the second group's write: 'aaa-first' (6 atoms, processed first) and
+    // CONCEPT (5 → 6 atoms, a membership change) — both T2.
+    const first = Array.from({ length: 6 }, (_, i) => ({
+      slug: `atoms/2026-01-01/first-${i}`, title: `First ${i}`, body: `First body ${i}.`, concept_refs: ['aaa-first'],
+    }));
+    await persist([...first, ...atoms(6)] as ReturnType<typeof atoms>);
+    await engine.setConfig(CONCEPTS_BUDGET_CONFIG_KEY, '0');
+    await runPhaseSynthesizeConcepts(engine, { _atoms: atoms(5) });
+    expect((await engine.getPage(CONCEPT_SLUG))?.frontmatter.synthesis_mode).toBe('budget_fallback');
+
+    let upgraded = false;
+    const progress = {
+      start: () => {}, heartbeat: () => {}, finish: () => {},
+      child: () => progress,
+      tick: () => {
+        if (upgraded) return;
+        upgraded = true;
+        // Simulate the overlapping run: rewrite CONCEPT as an LLM narrative.
+        // tick() is synchronous, so the write is fired, not awaited; PGLite runs
+        // queries in submission order, so it lands before the phase's next read.
+        void engine.executeRaw(
+          `UPDATE pages SET frontmatter = frontmatter || '{"synthesis_mode":"llm"}'::jsonb,
+                            compiled_truth = 'Narrative from the other run.'
+            WHERE slug = $1`,
+          [CONCEPT_SLUG],
+        );
+      },
+    };
+    const result = await runPhaseSynthesizeConcepts(engine, {
+      _atoms: [...first, ...atoms(6)],
+      _chat: countingChat([], 'unused'),
+      progress: progress as unknown as import('../../src/core/progress.ts').ProgressReporter,
+    });
+    expect(upgraded).toBe(true);
+    const page = await engine.getPage(CONCEPT_SLUG);
+    expect(page?.frontmatter.synthesis_mode).toBe('llm');
+    expect(page?.compiled_truth).toContain('Narrative from the other run.');
+    expect(result.details?.concepts_kept_existing).toBe(1);
+  });
+
   test('an empty-response fallback never replaces an existing LLM narrative', async () => {
     await persist(atoms(11));
     await runPhaseSynthesizeConcepts(engine, { _atoms: atoms(10), _chat: countingChat([], 'Original narrative.') });

@@ -151,6 +151,21 @@ async function loadExistingConceptState(
   return state;
 }
 
+/** Live read of one concept page's synthesis mode. Fail-closed to "not LLM" (the pre-guard behavior). */
+async function pageHoldsLlmNarrative(engine: BrainEngine, slug: string, sourceId: string): Promise<boolean> {
+  try {
+    const rows = await engine.executeRaw<{ mode: string | null }>(
+      `SELECT frontmatter->>'synthesis_mode' AS mode
+         FROM pages
+        WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL`,
+      [sourceId, slug],
+    );
+    return rows[0]?.mode === 'llm';
+  } catch {
+    return false;
+  }
+}
+
 export interface SynthesizeConceptsOpts {
   brainDir?: string;
   /**
@@ -454,7 +469,13 @@ export async function runPhaseSynthesizeConcepts(
     // unchanged template page has nothing new to write. The fingerprint is
     // left as-is, so the group is retried on the next run.
     const templateFallback = synthesisMode === 'budget_fallback' || synthesisMode === 'error_fallback';
-    const keepExisting = templateFallback && (existingIsLlm || unchanged);
+    let keepExisting = templateFallback && (existingIsLlm || unchanged);
+    // The state map is a run-start snapshot. Overlapping runs (a nightly
+    // `dream` alongside autopilot maintenance) can upgrade this page after
+    // it was taken, so re-read the live mode before writing a template over it.
+    if (templateFallback && !keepExisting && existing && !opts.dryRun) {
+      keepExisting = await pageHoldsLlmNarrative(engine, conceptSlug, opts.sourceId ?? 'default');
+    }
 
     if (keepExisting) {
       conceptsKeptExisting++;
