@@ -8,20 +8,20 @@
 //   - an empty-response fallback never replaces an existing LLM narrative
 //   - an unchanged template page is upgraded to an LLM narrative when budget allows
 //   - cycle.synthesize_concepts.budget_usd is honored (0 = template only)
-//   - the member fingerprint is order-independent and tier-sensitive
+//
+// Imports only entry points that exist before the fix, so the discrimination
+// check executes these tests against the pre-fix phase. Unit tests for the new
+// helpers live in synthesize-concepts-fingerprint.test.ts.
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
-import {
-  runPhaseSynthesizeConcepts,
-  resolveConceptsBudgetUsd,
-  conceptMemberFingerprint,
-  CONCEPTS_BUDGET_CONFIG_KEY,
-} from '../../src/core/cycle/synthesize-concepts.ts';
+import { runPhaseSynthesizeConcepts } from '../../src/core/cycle/synthesize-concepts.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import type { ChatResult, ChatOpts } from '../../src/core/ai/gateway.ts';
 
 type ChatFn = typeof import('../../src/core/ai/gateway.ts').chat;
+
+const CONCEPTS_BUDGET_CONFIG_KEY = 'cycle.synthesize_concepts.budget_usd';
 
 let engine: PGLiteEngine;
 
@@ -167,43 +167,23 @@ describe('synthesize_concepts change detection', () => {
   });
 });
 
-describe('synthesize_concepts budget config', () => {
-  test('unset falls back to the default ceiling', async () => {
-    expect(await resolveConceptsBudgetUsd(engine)).toBe(1.5);
-  });
-
-  test('a configured value wins, including 0', async () => {
-    await engine.setConfig(CONCEPTS_BUDGET_CONFIG_KEY, '12.5');
-    expect(await resolveConceptsBudgetUsd(engine)).toBe(12.5);
-    await engine.setConfig(CONCEPTS_BUDGET_CONFIG_KEY, '0');
-    expect(await resolveConceptsBudgetUsd(engine)).toBe(0);
-  });
-
-  test('an invalid or negative value falls back to the default', async () => {
-    await engine.setConfig(CONCEPTS_BUDGET_CONFIG_KEY, 'lots');
-    expect(await resolveConceptsBudgetUsd(engine)).toBe(1.5);
-    await engine.setConfig(CONCEPTS_BUDGET_CONFIG_KEY, '-1');
-    expect(await resolveConceptsBudgetUsd(engine)).toBe(1.5);
-  });
-
-  test('the configured ceiling is reported in the phase result', async () => {
-    const list = atoms(3);
+describe('synthesize_concepts budget config (via the phase)', () => {
+  test('a configured ceiling is reported in the phase result', async () => {
     await engine.setConfig(CONCEPTS_BUDGET_CONFIG_KEY, '7');
-    const result = await runPhaseSynthesizeConcepts(engine, { _atoms: list, dryRun: true });
+    const result = await runPhaseSynthesizeConcepts(engine, { _atoms: atoms(3), dryRun: true });
     expect(result.details?.budget_usd).toBe(7);
   });
-});
 
-describe('conceptMemberFingerprint', () => {
-  test('is independent of member order', () => {
-    const a = conceptMemberFingerprint({ tier: 'T1', atomSlugs: ['atoms/b', 'atoms/a', 'atoms/c'] });
-    const b = conceptMemberFingerprint({ tier: 'T1', atomSlugs: ['atoms/c', 'atoms/b', 'atoms/a'] });
-    expect(a).toBe(b);
+  test('budget 0 writes a template narrative with no LLM call', async () => {
+    await engine.setConfig(CONCEPTS_BUDGET_CONFIG_KEY, '0');
+    const calls: string[] = [];
+    const result = await runPhaseSynthesizeConcepts(engine, { _atoms: atoms(10), _chat: countingChat(calls, 'unused') });
+    expect(calls).toHaveLength(0);
+    expect((result.details?.synthesis_mode_counts as Record<string, number>).budget_fallback).toBe(1);
   });
 
-  test('changes with membership and with tier', () => {
-    const base = conceptMemberFingerprint({ tier: 'T2', atomSlugs: ['atoms/a', 'atoms/b'] });
-    expect(conceptMemberFingerprint({ tier: 'T2', atomSlugs: ['atoms/a', 'atoms/c'] })).not.toBe(base);
-    expect(conceptMemberFingerprint({ tier: 'T1', atomSlugs: ['atoms/a', 'atoms/b'] })).not.toBe(base);
+  test('guard (passes pre-fix too): unset keeps the default ceiling', async () => {
+    const result = await runPhaseSynthesizeConcepts(engine, { _atoms: atoms(3), dryRun: true });
+    expect(result.details?.budget_usd).toBe(1.5);
   });
 });
